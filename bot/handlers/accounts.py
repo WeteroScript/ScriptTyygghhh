@@ -1,8 +1,12 @@
+import re
+
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram.errors import (
+    SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, PasswordHashInvalid,
+)
 
 from bot.database import (
     get_user, list_accounts, add_account, remove_account,
@@ -13,6 +17,11 @@ from bot.keyboards import accounts_menu_kb, accounts_remove_kb, account_control_
 from bot.services import session_manager, gift_sniper
 
 router = Router()
+
+# Код должен вводиться строго как "code" + сами цифры без пробела,
+# например: code12345. Это же защищает от автоматической блокировки
+# кода Telegram, если его "чистый" текст засветится где-то ещё.
+CODE_PATTERN = re.compile(r"^code(\d{4,7})$", re.IGNORECASE)
 
 
 class AddAccount(StatesGroup):
@@ -61,8 +70,15 @@ async def add_account_code(message: Message, state: FSMContext):
     lang = await _lang_of(message.from_user.id)
     data = await state.get_data()
     phone = data["phone"]
-    code = message.text.strip()
     owner_id = message.from_user.id
+    raw = (message.text or "").strip()
+
+    match = CODE_PATTERN.match(raw)
+    if not match:
+        await message.answer(t(lang, "code_format_wrong"))
+        return
+    code = match.group(1)
+
     try:
         await session_manager.submit_code(owner_id, phone, data["phone_code_hash"], code)
     except SessionPasswordNeeded:
@@ -70,7 +86,7 @@ async def add_account_code(message: Message, state: FSMContext):
         await message.answer(t(lang, "send_2fa"))
         return
     except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-        await message.answer(f"Ошибка кода: {e}. Попробуй /start заново.")
+        await message.answer(t(lang, "code_invalid", error=str(e)))
         session_manager.cancel_pending(owner_id)
         await state.clear()
         return
@@ -89,8 +105,14 @@ async def add_account_password(message: Message, state: FSMContext):
     owner_id = message.from_user.id
     try:
         await session_manager.submit_password(owner_id, message.text.strip())
+    except PasswordHashInvalid:
+        # неверный пароль 2FA — даём ввести ещё раз, не сбрасывая процесс
+        await message.answer(t(lang, "password_wrong"))
+        return
     except Exception as e:
-        await message.answer(f"Ошибка пароля: {e}")
+        await message.answer(t(lang, "password_error", error=str(e)))
+        session_manager.cancel_pending(owner_id)
+        await state.clear()
         return
 
     session_name = session_manager.get_session_name(owner_id, phone)
