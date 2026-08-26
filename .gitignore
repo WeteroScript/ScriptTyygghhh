@@ -1,0 +1,8 @@
+.env
+venv/
+__pycache__/
+*.pyc
+sessions/
+bot/database.sqlite3
+*.session
+*.session-journal
