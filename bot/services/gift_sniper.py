@@ -27,6 +27,12 @@ log = logging.getLogger("gift_sniper")
 
 # ключ: (owner_id, phone) -> asyncio.Task
 _running_tasks: dict[tuple[int, str], asyncio.Task] = {}
+# ключ: (owner_id, phone) -> активный Client (пока задача мониторинга жива).
+# Нужен, чтобы другие части бота (раздел "Подарки") переиспользовали ЭТО ЖЕ
+# подключение вместо того, чтобы открывать второе на тот же файл сессии —
+# два одновременных Client на одну .session сессию ломают её (peer storage
+# начинает противоречить сама себе, отсюда "Peer id invalid" и т.п.).
+_active_clients: dict[tuple[int, str], Client] = {}
 
 
 @dataclass
@@ -44,8 +50,8 @@ async def fetch_gifts(client: Client) -> list[GiftListing]:
     result: list[GiftListing] = []
     try:
         gifts_resp = await client.invoke(functions.payments.GetStarGifts(hash=0))
-    except Exception as e:
-        log.warning("Не удалось получить список подарков: %s", e)
+    except Exception:
+        log.exception("Не удалось получить список подарков (payments.GetStarGifts)")
         return result
 
     gifts = getattr(gifts_resp, "gifts", [])
@@ -183,12 +189,22 @@ def is_running(owner_id: int, phone: str) -> bool:
     return bool(task and not task.done())
 
 
+def get_running_client(owner_id: int, phone: str) -> Client | None:
+    """Возвращает уже подключённый Client, если для этого аккаунта запущен
+    мониторинг. Используй это вместо создания нового Client на тот же
+    файл сессии — иначе два подключения начнут конфликтовать."""
+    if is_running(owner_id, phone):
+        return _active_clients.get((owner_id, phone))
+    return None
+
+
 async def start_sniper(owner_id: int, phone: str, client: Client):
     key = (owner_id, phone)
     if is_running(owner_id, phone):
         return
     if not client.is_connected:
         await client.start()
+    _active_clients[key] = client
     task = asyncio.create_task(_monitor_loop(owner_id, phone, client))
     _running_tasks[key] = task
 
@@ -198,3 +214,14 @@ async def stop_sniper(owner_id: int, phone: str):
     task = _running_tasks.pop(key, None)
     if task:
         task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    client = _active_clients.pop(key, None)
+    if client and client.is_connected:
+        try:
+            await client.stop()
+        except Exception:
+            log.exception("Ошибка при остановке клиента %s/%s", owner_id, phone)
