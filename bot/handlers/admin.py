@@ -48,7 +48,7 @@ async def cmd_giveaccess(message: Message, bot: Bot):
     lang = await _lang_of(message.from_user.id)
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("Использование: /giveaccess <id|@username>")
+        await message.answer("Использование: /giveaccess id или @username")
         return
     try:
         target_id = await _resolve_target(bot, args[1])
@@ -66,7 +66,7 @@ async def cmd_unaccess(message: Message, bot: Bot):
     lang = await _lang_of(message.from_user.id)
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("Использование: /unaccess <id|@username>")
+        await message.answer("Использование: /unaccess id или @username")
         return
     try:
         target_id = await _resolve_target(bot, args[1])
