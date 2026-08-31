@@ -1,13 +1,14 @@
+"""Менеджер юзер-сессий Telethon: логин по номеру телефона, код, 2FA."""
+
 import os
-from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded
+from telethon import TelegramClient
 
 from bot.config import API_ID, API_HASH, SESSIONS_DIR
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# активные Client'ы, которые сейчас логинятся пошагово: {telegram_user_id: Client}
-_pending_clients: dict[int, Client] = {}
+# активные Client'ы, которые сейчас логинятся пошагово: {telegram_user_id: TelegramClient}
+_pending_clients: dict[int, TelegramClient] = {}
 
 
 def _session_name(owner_id: int, phone: str) -> str:
@@ -15,25 +16,23 @@ def _session_name(owner_id: int, phone: str) -> str:
     return f"{owner_id}_{clean}"
 
 
+def _session_path(owner_id: int, phone: str) -> str:
+    return os.path.join(SESSIONS_DIR, _session_name(owner_id, phone))
+
+
 async def start_login(owner_id: int, phone: str) -> str:
     """Шаг 1: отправляет код на телефон, возвращает phone_code_hash."""
-    session_name = _session_name(owner_id, phone)
-    client = Client(
-        name=session_name,
-        api_id=API_ID,
-        api_hash=API_HASH,
-        workdir=SESSIONS_DIR,
-    )
+    client = TelegramClient(_session_path(owner_id, phone), API_ID, API_HASH)
     await client.connect()
-    sent = await client.send_code(phone)
+    sent = await client.send_code_request(phone)
     _pending_clients[owner_id] = client
     return sent.phone_code_hash
 
 
 async def submit_code(owner_id: int, phone: str, phone_code_hash: str, code: str):
-    """Шаг 2: подтверждает код. Может бросить SessionPasswordNeeded."""
+    """Шаг 2: подтверждает код. Может бросить SessionPasswordNeededError."""
     client = _pending_clients[owner_id]
-    await client.sign_in(phone, phone_code_hash, code)
+    await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
     await client.disconnect()
     del _pending_clients[owner_id]
 
@@ -41,7 +40,7 @@ async def submit_code(owner_id: int, phone: str, phone_code_hash: str, code: str
 async def submit_password(owner_id: int, password: str):
     """Шаг 3 (если включена 2FA)."""
     client = _pending_clients[owner_id]
-    await client.check_password(password)
+    await client.sign_in(password=password)
     await client.disconnect()
     del _pending_clients[owner_id]
 
@@ -55,18 +54,11 @@ def get_session_name(owner_id: int, phone: str) -> str:
 
 
 def delete_session_file(owner_id: int, phone: str):
-    session_name = _session_name(owner_id, phone)
-    path = os.path.join(SESSIONS_DIR, f"{session_name}.session")
+    path = _session_path(owner_id, phone) + ".session"
     if os.path.exists(path):
         os.remove(path)
 
 
-def make_client(owner_id: int, phone: str) -> Client:
-    """Создаёт (но не запускает) Client для уже сохранённой сессии."""
-    session_name = _session_name(owner_id, phone)
-    return Client(
-        name=session_name,
-        api_id=API_ID,
-        api_hash=API_HASH,
-        workdir=SESSIONS_DIR,
-    )
+def make_client(owner_id: int, phone: str) -> TelegramClient:
+    """Создаёт (но не подключает) TelegramClient для уже сохранённой сессии."""
+    return TelegramClient(_session_path(owner_id, phone), API_ID, API_HASH)
