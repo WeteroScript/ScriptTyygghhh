@@ -1,24 +1,27 @@
 """
-Мониторинг NFT-маркета подарков Telegram и автопокупка.
+Мониторинг NFT-маркета подарков Telegram и автопокупка (на Telethon).
 
 Логика простая: бот смотрит на самый дешёвый лот перепродажи каждого
 подарка, и если его цена попадает в диапазон [SNIPE_MIN_PRICE,
 SNIPE_MAX_PRICE] (включительно) — покупает его немедленно.
 
-ВАЖНО: используются raw MTProto функции через Pyrogram (payments.GetStarGifts /
+ВАЖНО: используются raw MTProto функции через Telethon (payments.GetStarGifts /
 payments.GetResaleStarGifts / payments.GetPaymentForm / payments.SendStarsForm с
-InputInvoiceStarGiftResale, payments.GetStarsStatus для баланса). Telegram
-время от времени меняет схему этих функций — если что-то перестало
-работать, свериться с https://core.telegram.org/api/gifts и поправить
-raw-вызовы (номера конструкторов, поля).
+InputInvoiceStarGiftResale, payments.GetStarsStatus для баланса). Актуальная
+схема (проверено по https://core.telegram.org/api/gifts и
+https://tl.telethon.dev): цена лота на перепродаже лежит в поле
+`resell_amount` (список StarsAmount/StarsTonAmount), а НЕ в `stars` — это
+поле только у обычных (не аукционных) позиций подарка.
+
+Telegram время от времени меняет схему — если что-то перестало работать,
+свериться с документацией выше и поправить raw-вызовы.
 """
 
 import asyncio
 import logging
 from dataclasses import dataclass
 
-from pyrogram import Client
-from pyrogram.raw import functions, types as raw_types
+from telethon import TelegramClient, functions, types
 
 from bot.config import SNIPE_MIN_PRICE, SNIPE_MAX_PRICE, POLL_INTERVAL
 from bot.database import get_ignored_gifts
@@ -27,29 +30,48 @@ log = logging.getLogger("gift_sniper")
 
 # ключ: (owner_id, phone) -> asyncio.Task
 _running_tasks: dict[tuple[int, str], asyncio.Task] = {}
-# ключ: (owner_id, phone) -> активный Client (пока задача мониторинга жива).
-# Нужен, чтобы другие части бота (раздел "Подарки") переиспользовали ЭТО ЖЕ
-# подключение вместо того, чтобы открывать второе на тот же файл сессии —
-# два одновременных Client на одну .session сессию ломают её (peer storage
-# начинает противоречить сама себе, отсюда "Peer id invalid" и т.п.).
-_active_clients: dict[tuple[int, str], Client] = {}
+# ключ: (owner_id, phone) -> активный TelegramClient (пока задача мониторинга жива).
+_active_clients: dict[tuple[int, str], TelegramClient] = {}
+# ключ: (owner_id, phone) -> asyncio.Lock — не даёт двум подключениям
+# одновременно открыться на один и тот же файл сессии (иначе sqlite
+# сессии ловит "database is locked" и session-хранилище портится).
+_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def get_lock(key: tuple[int, str]) -> asyncio.Lock:
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    return _locks[key]
 
 
 @dataclass
 class GiftListing:
     gift_id: str
     name: str
-    base_price: int           # обычная (не резельная) цена подарка в звёздах
-    resale_price: int | None   # текущая минимальная цена лота на перепродаже (если есть)
-    resale_slug: str | None     # идентификатор конкретного лота (нужен для покупки)
-    input_invoice: object        # объект, который передаём в оплату (raw type)
+    base_price: int            # обычная (не резельная) цена подарка в звёздах
+    resale_price: int | None    # текущая минимальная цена лота на перепродаже (если есть)
+    resale_slug: str | None      # идентификатор конкретного лота (нужен для покупки)
+    input_invoice: object          # объект, который передаём в оплату (raw type)
 
 
-async def fetch_gifts(client: Client) -> list[GiftListing]:
+def _extract_stars_amount(amounts) -> int | None:
+    """
+    resell_amount — список StarsAmount/StarsTonAmount. Нас интересует
+    именно вариант в звёздах (StarsAmount), не в TON.
+    """
+    if not amounts:
+        return None
+    for a in amounts:
+        if a.__class__.__name__ == "StarsAmount":
+            return int(getattr(a, "amount", 0))
+    return None
+
+
+async def fetch_gifts(client: TelegramClient) -> list[GiftListing]:
     """Список подарков с их актуальной минимальной ценой."""
     result: list[GiftListing] = []
     try:
-        gifts_resp = await client.invoke(functions.payments.GetStarGifts(hash=0))
+        gifts_resp = await client(functions.payments.GetStarGiftsRequest(hash=0))
     except Exception:
         log.exception("Не удалось получить список подарков (payments.GetStarGifts)")
         return result
@@ -62,14 +84,14 @@ async def fetch_gifts(client: Client) -> list[GiftListing]:
 
         resale_price = None
         resale_slug = None
-        input_invoice = raw_types.InputInvoiceStarGift(
-            peer=raw_types.InputPeerSelf(), gift_id=g.id
+        input_invoice = types.InputInvoiceStarGift(
+            peer=types.InputPeerSelf(), gift_id=g.id
         )
 
         if getattr(g, "availability_resale", None):
             try:
-                resale_resp = await client.invoke(
-                    functions.payments.GetResaleStarGifts(
+                resale_resp = await client(
+                    functions.payments.GetResaleStarGiftsRequest(
                         gift_id=g.id,
                         sort_by_price=True,
                         offset="",
@@ -79,17 +101,15 @@ async def fetch_gifts(client: Client) -> list[GiftListing]:
                 resale_gifts = getattr(resale_resp, "gifts", [])
                 if resale_gifts:
                     cheapest = resale_gifts[0]
-                    resale_price = getattr(cheapest, "resell_stars", None) or getattr(
-                        cheapest, "stars", None
-                    )
+                    resale_price = _extract_stars_amount(getattr(cheapest, "resell_amount", None))
                     resale_slug = getattr(cheapest, "slug", None)
-                    input_invoice = raw_types.InputInvoiceStarGiftResale(
-                        peer=raw_types.InputPeerSelf(),
-                        slug=resale_slug,
-                        to_id=raw_types.InputPeerSelf(),
-                    )
-            except Exception as e:
-                log.debug("Resale недоступен для %s: %s", gift_id, e)
+                    if resale_slug:
+                        input_invoice = types.InputInvoiceStarGiftResale(
+                            slug=resale_slug,
+                            to_id=types.InputPeerSelf(),
+                        )
+            except Exception:
+                log.debug("Resale недоступен для %s", gift_id, exc_info=True)
 
         result.append(
             GiftListing(
@@ -115,15 +135,18 @@ def cheapest_gift(gifts: list[GiftListing]) -> GiftListing | None:
     return min(gifts, key=effective_price)
 
 
-async def get_stars_balance(client: Client) -> int | None:
+async def get_stars_balance(client: TelegramClient) -> int | None:
     """Баланс звёзд на подключённом аккаунте. None, если не удалось получить."""
     try:
-        status = await client.invoke(
-            functions.payments.GetStarsStatus(peer=raw_types.InputPeerSelf())
+        status = await client(
+            functions.payments.GetStarsStatusRequest(peer=types.InputPeerSelf())
         )
-        return getattr(status, "balance", None) and getattr(status.balance, "amount", None)
-    except Exception as e:
-        log.debug("Не удалось получить баланс звёзд: %s", e)
+        balance = getattr(status, "balance", None)
+        if balance is None:
+            return None
+        return int(getattr(balance, "amount", 0))
+    except Exception:
+        log.debug("Не удалось получить баланс звёзд", exc_info=True)
         return None
 
 
@@ -134,13 +157,13 @@ def should_snipe(g: GiftListing) -> bool:
     return SNIPE_MIN_PRICE <= g.resale_price <= SNIPE_MAX_PRICE
 
 
-async def buy_gift(client: Client, g: GiftListing) -> bool:
+async def buy_gift(client: TelegramClient, g: GiftListing) -> bool:
     try:
-        form = await client.invoke(
-            functions.payments.GetPaymentForm(invoice=g.input_invoice)
+        form = await client(
+            functions.payments.GetPaymentFormRequest(invoice=g.input_invoice)
         )
-        await client.invoke(
-            functions.payments.SendStarsForm(
+        await client(
+            functions.payments.SendStarsFormRequest(
                 form_id=form.form_id,
                 invoice=g.input_invoice,
             )
@@ -148,11 +171,21 @@ async def buy_gift(client: Client, g: GiftListing) -> bool:
         log.info("Куплен подарок %s (%s) за %s звёзд", g.name, g.gift_id, effective_price(g))
         return True
     except Exception as e:
-        log.error("Не удалось купить подарок %s: %s", g.gift_id, e)
+        msg = str(e).upper()
+        if "FORM_EXPIRED" in msg:
+            # Форма оплаты живёт 10 минут — лот мог "протухнуть" между
+            # тем, как мы его увидели, и попыткой купить. Это нормальная
+            # ситуация при снайпинге, не ошибка кода: просто пропускаем,
+            # следующий цикл опроса возьмёт актуальный лот заново.
+            log.warning("Форма оплаты истекла для %s, лот больше не актуален", g.gift_id)
+        elif "BALANCE_TOO_LOW" in msg:
+            log.warning("Недостаточно звёзд для покупки %s (сервер отклонил платёж)", g.gift_id)
+        else:
+            log.exception("Не удалось купить подарок %s", g.gift_id)
         return False
 
 
-async def _monitor_loop(owner_id: int, phone: str, client: Client):
+async def _monitor_loop(owner_id: int, phone: str, client: TelegramClient):
     log.info("Старт мониторинга для %s / %s", owner_id, phone)
     try:
         while True:
@@ -189,7 +222,7 @@ def is_running(owner_id: int, phone: str) -> bool:
     return bool(task and not task.done())
 
 
-def get_running_client(owner_id: int, phone: str) -> Client | None:
+def get_running_client(owner_id: int, phone: str) -> TelegramClient | None:
     """Возвращает уже подключённый Client, если для этого аккаунта запущен
     мониторинг. Используй это вместо создания нового Client на тот же
     файл сессии — иначе два подключения начнут конфликтовать."""
@@ -198,30 +231,34 @@ def get_running_client(owner_id: int, phone: str) -> Client | None:
     return None
 
 
-async def start_sniper(owner_id: int, phone: str, client: Client):
+async def start_sniper(owner_id: int, phone: str, client: TelegramClient):
     key = (owner_id, phone)
     if is_running(owner_id, phone):
         return
-    if not client.is_connected:
-        await client.start()
-    _active_clients[key] = client
-    task = asyncio.create_task(_monitor_loop(owner_id, phone, client))
-    _running_tasks[key] = task
+    async with get_lock(key):
+        if is_running(owner_id, phone):
+            return
+        if not client.is_connected():
+            await client.connect()
+        _active_clients[key] = client
+        task = asyncio.create_task(_monitor_loop(owner_id, phone, client))
+        _running_tasks[key] = task
 
 
 async def stop_sniper(owner_id: int, phone: str):
     key = (owner_id, phone)
-    task = _running_tasks.pop(key, None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    async with get_lock(key):
+        task = _running_tasks.pop(key, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-    client = _active_clients.pop(key, None)
-    if client and client.is_connected:
-        try:
-            await client.stop()
-        except Exception:
-            log.exception("Ошибка при остановке клиента %s/%s", owner_id, phone)
+        client = _active_clients.pop(key, None)
+        if client and client.is_connected():
+            try:
+                await client.disconnect()
+            except Exception:
+                log.exception("Ошибка при остановке клиента %s/%s", owner_id, phone)
