@@ -22,7 +22,10 @@ log = logging.getLogger("main")
 
 async def _resume_running_accounts():
     """После рестарта бота снова запускает мониторинг для аккаунтов,
-    у которых is_running=1 в базе (например, бот перезапустился на хостинге)."""
+    у которых is_running=1 в базе (например, бот перезапустился на хостинге).
+    start_sniper сам подключается через connect_with_retry, поэтому
+    временная блокировка файла сессии от ещё не закрывшегося старого
+    процесса не приводит к падению."""
     rows = await all_running_accounts()
     for r in rows:
         owner_id, phone = r["owner_id"], r["phone"]
@@ -52,7 +55,16 @@ async def main():
     await _resume_running_accounts()
 
     log.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Важно при передеплое/остановке на хостинге: если процесс убьют
+        # без этого блока, MTProto-подключения останутся "подвешенными",
+        # а файлы сессий — не до конца освобождёнными для следующего
+        # запуска (отсюда "database is locked" и "Task was destroyed but
+        # it is pending" в логах при рестарте).
+        log.info("Останавливаю активные подключения перед выходом...")
+        await gift_sniper.stop_all()
 
 
 if __name__ == "__main__":
