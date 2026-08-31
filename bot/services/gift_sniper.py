@@ -44,6 +44,31 @@ def get_lock(key: tuple[int, str]) -> asyncio.Lock:
     return _locks[key]
 
 
+async def connect_with_retry(client: TelegramClient, attempts: int = 5, delay: float = 2.0):
+    """
+    Подключение с повтором при "database is locked" — эта ошибка почти
+    всегда временная: старый процесс бота (например, при передеплое на
+    хостинге) на секунду-две ещё держит файл сессии, пока не завершится
+    сам. Вместо немедленного отказа даём ему время закрыться.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await client.connect()
+            return
+        except Exception as e:
+            last_error = e
+            if "database is locked" in str(e).lower() and attempt < attempts:
+                log.warning(
+                    "Файл сессии временно занят (попытка %s/%s), жду %.0fс",
+                    attempt, attempts, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+    raise last_error
+
+
 @dataclass
 class GiftListing:
     gift_id: str
@@ -239,7 +264,7 @@ async def start_sniper(owner_id: int, phone: str, client: TelegramClient):
         if is_running(owner_id, phone):
             return
         if not client.is_connected():
-            await client.connect()
+            await connect_with_retry(client)
         _active_clients[key] = client
         task = asyncio.create_task(_monitor_loop(owner_id, phone, client))
         _running_tasks[key] = task
@@ -262,3 +287,18 @@ async def stop_sniper(owner_id: int, phone: str):
                 await client.disconnect()
             except Exception:
                 log.exception("Ошибка при остановке клиента %s/%s", owner_id, phone)
+
+
+async def stop_all():
+    """
+    Останавливает все активные подключения. Вызывается при graceful
+    shutdown бота (SIGTERM от хостинга при передеплое) — чтобы файлы
+    сессий гарантированно освобождались и следующий запуск не ловил
+    "database is locked" из-за ещё не закрытого предыдущего процесса.
+    """
+    keys = list(_running_tasks.keys())
+    for owner_id, phone in keys:
+        try:
+            await stop_sniper(owner_id, phone)
+        except Exception:
+            log.exception("Ошибка при остановке %s/%s во время shutdown", owner_id, phone)
