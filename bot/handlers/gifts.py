@@ -56,7 +56,7 @@ async def _get_client_for_gifts(owner_id: int):
 
         client = session_manager.make_client(owner_id, phone)
         try:
-            await client.connect()
+            await gift_sniper.connect_with_retry(client)
         except Exception:
             log.exception("Не удалось временно подключиться к аккаунту %s для чтения подарков", phone)
             return None, False
