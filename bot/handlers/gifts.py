@@ -12,6 +12,11 @@ from bot.utils import safe_edit_text
 router = Router()
 log = logging.getLogger("handlers.gifts")
 
+# Telegram ограничивает суммарный размер inline-клавиатуры одного сообщения.
+# Если подарков много, показываем только самые дешёвые — остальные всё равно
+# наименее интересны для снайпинга.
+MAX_GIFT_BUTTONS = 40
+
 
 async def _lang_of(user_id: int) -> str:
     row = await get_user(user_id)
@@ -25,10 +30,12 @@ async def _get_client_for_gifts(owner_id: int):
     Если хотя бы один из аккаунтов пользователя уже мониторится (нажат
     "старт") — переиспользуем ЕГО подключение. Открывать второе
     подключение на тот же файл сессии нельзя: они начинают конфликтовать
-    и ломают peer-хранилище сессии (отсюда ошибки вида "Peer id invalid").
+    и ломают сессию (sqlite "database is locked" и т.п.).
 
     Если запущенных аккаунтов нет — поднимаем временное подключение на
-    первом добавленном аккаунте, читаем подарки и сразу его закрываем.
+    первом добавленном аккаунте (под блокировкой, чтобы не столкнуться с
+    одновременным нажатием "старт" на тот же аккаунт), читаем подарки и
+    сразу его закрываем.
     """
     accounts = await list_accounts(owner_id)
     if not accounts:
@@ -40,13 +47,20 @@ async def _get_client_for_gifts(owner_id: int):
             return client, False
 
     phone = accounts[0]["phone"]
-    client = session_manager.make_client(owner_id, phone)
-    try:
-        await client.start()
-    except Exception:
-        log.exception("Не удалось временно подключиться к аккаунту %s для чтения подарков", phone)
-        return None, False
-    return client, True
+    key = (owner_id, phone)
+    async with gift_sniper.get_lock(key):
+        # перепроверяем — вдруг мониторинг успел запуститься, пока ждали лок
+        client = gift_sniper.get_running_client(owner_id, phone)
+        if client:
+            return client, False
+
+        client = session_manager.make_client(owner_id, phone)
+        try:
+            await client.connect()
+        except Exception:
+            log.exception("Не удалось временно подключиться к аккаунту %s для чтения подарков", phone)
+            return None, False
+        return client, True
 
 
 @router.callback_query(F.data == "menu:gifts")
@@ -64,7 +78,7 @@ async def open_gifts(call: CallbackQuery):
     finally:
         if temporary:
             try:
-                await client.stop()
+                await client.disconnect()
             except Exception:
                 log.exception("Не удалось закрыть временное подключение")
 
@@ -76,12 +90,18 @@ async def open_gifts(call: CallbackQuery):
     cheapest = gifts_sorted[0]
     ignored = await get_ignored_gifts(owner_id)
 
+    total = len(gifts_sorted)
+    shown = gifts_sorted[:MAX_GIFT_BUTTONS]
+
     text = t(lang, "gifts_title") + "\n\n" + t(
         lang, "cheapest_gift", name=cheapest.name, price=gift_sniper.effective_price(cheapest)
     )
+    if total > len(shown):
+        text += "\n\n" + t(lang, "gifts_truncated", shown=len(shown), total=total)
+
     kb_items = [
         {"id": g.gift_id, "name": g.name, "price": gift_sniper.effective_price(g)}
-        for g in gifts_sorted
+        for g in shown
     ]
     await safe_edit_text(call.message, text, reply_markup=gifts_kb(kb_items, ignored))
     await call.answer()
