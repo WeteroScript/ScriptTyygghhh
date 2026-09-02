@@ -95,3 +95,9 @@ async def back_to_main(call: CallbackQuery):
     lang = row["lang"] if row and row["lang"] else "ru"
     await safe_edit_text(call.message, t(lang, "main_menu"), reply_markup=main_menu_kb(lang))
     await call.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def noop(call: CallbackQuery):
+    """Кнопка-индикатор (например, номер страницы) — просто гасит "часики"."""
+    await call.answer()
