@@ -24,7 +24,8 @@ from dataclasses import dataclass
 from telethon import TelegramClient, functions, types
 
 from bot.config import SNIPE_MIN_PRICE, SNIPE_MAX_PRICE, POLL_INTERVAL
-from bot.database import get_ignored_gifts
+from bot.database import get_ignored_gifts, get_price_range
+from bot.services import notifier
 
 log = logging.getLogger("gift_sniper")
 
@@ -154,10 +155,31 @@ def effective_price(g: GiftListing) -> int:
     return g.resale_price if g.resale_price is not None else g.base_price
 
 
+def on_market(g: GiftListing) -> bool:
+    """True, если у подарка есть реальный активный лот на перепродаже
+    (маркете) — а не просто позиция в каталоге магазина."""
+    return g.resale_price is not None
+
+
+def filter_market_gifts(gifts: list["GiftListing"]) -> list["GiftListing"]:
+    """Оставляет только те подарки, что реально выставлены на маркете."""
+    return [g for g in gifts if on_market(g)]
+
+
 def cheapest_gift(gifts: list[GiftListing]) -> GiftListing | None:
     if not gifts:
         return None
     return min(gifts, key=effective_price)
+
+
+async def get_effective_price_range(owner_id: int) -> tuple[int, int]:
+    """Диапазон цены для снайпинга этого пользователя: кастомный, если
+    он его настроил в разделе "Настройки", иначе — из переменных
+    окружения (значения по умолчанию для всех)."""
+    custom_min, custom_max = await get_price_range(owner_id)
+    min_price = custom_min if custom_min is not None else SNIPE_MIN_PRICE
+    max_price = custom_max if custom_max is not None else SNIPE_MAX_PRICE
+    return min_price, max_price
 
 
 async def get_stars_balance(client: TelegramClient) -> int | None:
@@ -175,11 +197,11 @@ async def get_stars_balance(client: TelegramClient) -> int | None:
         return None
 
 
-def should_snipe(g: GiftListing) -> bool:
-    """Покупаем только лоты на перепродаже с ценой в диапазоне [MIN, MAX]."""
+def should_snipe(g: GiftListing, min_price: int, max_price: int) -> bool:
+    """Покупаем только лоты на перепродаже с ценой в диапазоне [min, max]."""
     if g.resale_price is None:
         return False
-    return SNIPE_MIN_PRICE <= g.resale_price <= SNIPE_MAX_PRICE
+    return min_price <= g.resale_price <= max_price
 
 
 async def buy_gift(client: TelegramClient, g: GiftListing) -> bool:
@@ -215,26 +237,42 @@ async def _monitor_loop(owner_id: int, phone: str, client: TelegramClient):
     try:
         while True:
             ignored = await get_ignored_gifts(owner_id)
+            min_price, max_price = await get_effective_price_range(owner_id)
             gifts = await fetch_gifts(client)
+            market_gifts = [g for g in filter_market_gifts(gifts) if g.gift_id not in ignored]
+
+            if market_gifts:
+                names = ", ".join(f"«{g.name}»" for g in market_gifts)
+                await notifier.send_log(owner_id, f"🔍 Просмотр лотов подарка {names}")
+
             balance = await get_stars_balance(client)
 
-            for g in gifts:
-                if g.gift_id in ignored:
-                    continue
-                if not should_snipe(g):
+            for g in market_gifts:
+                if not should_snipe(g, min_price, max_price):
                     continue
 
                 price = effective_price(g)
+                await notifier.send_log(
+                    owner_id, f"🎯 Найден подарок «{g.name}» за {price}⭐, покупка..."
+                )
+
                 if balance is not None and balance < price:
                     log.warning(
                         "Недостаточно звёзд на аккаунте %s: нужно %s, есть %s. Пропуск %s",
                         phone, price, balance, g.name,
                     )
+                    await notifier.send_log(
+                        owner_id, f"❌ Недостаточно звёзд для «{g.name}» (нужно {price}⭐)"
+                    )
                     continue
 
                 bought = await buy_gift(client, g)
-                if bought and balance is not None:
-                    balance -= price  # чтобы не пытаться купить два подарка подряд без баланса
+                if bought:
+                    await notifier.send_log(owner_id, f"✅ Куплено: «{g.name}» за {price}⭐")
+                    if balance is not None:
+                        balance -= price  # чтобы не пытаться купить два подарка подряд без баланса
+                else:
+                    await notifier.send_log(owner_id, f"❌ Не удалось купить «{g.name}»")
 
             await asyncio.sleep(POLL_INTERVAL)
     except asyncio.CancelledError:
