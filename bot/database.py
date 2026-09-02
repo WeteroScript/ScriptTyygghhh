@@ -30,6 +30,16 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- персональные настройки снайпинга: диапазон цены и вкл/выкл логов.
+-- min_price/max_price NULL = использовать значения из переменных
+-- окружения SNIPE_MIN_PRICE/SNIPE_MAX_PRICE по умолчанию.
+CREATE TABLE IF NOT EXISTS user_settings (
+    owner_id INTEGER PRIMARY KEY,
+    min_price INTEGER DEFAULT NULL,
+    max_price INTEGER DEFAULT NULL,
+    logs_enabled INTEGER DEFAULT 0
+);
 """
 
 
@@ -203,3 +213,50 @@ async def get_ignored_gifts(owner_id: int) -> set:
         )
         rows = await cur.fetchall()
         return {r[0] for r in rows}
+
+
+# ---------- персональные настройки снайпинга ----------
+
+async def get_price_range(owner_id: int):
+    """Возвращает (min_price, max_price) — либо кастомные значения
+    пользователя, либо None, None если он их не задавал (тогда
+    вызывающий код берёт значения из переменных окружения)."""
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT min_price, max_price FROM user_settings WHERE owner_id=?", (owner_id,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None, None
+        return row["min_price"], row["max_price"]
+
+
+async def set_price_range(owner_id: int, min_price: int, max_price: int):
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO user_settings (owner_id, min_price, max_price) VALUES (?, ?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET min_price=excluded.min_price, max_price=excluded.max_price",
+            (owner_id, min_price, max_price),
+        )
+        await db.commit()
+
+
+async def get_logs_enabled(owner_id: int) -> bool:
+    async with get_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT logs_enabled FROM user_settings WHERE owner_id=?", (owner_id,)
+        )
+        row = await cur.fetchone()
+        return bool(row and row["logs_enabled"])
+
+
+async def set_logs_enabled(owner_id: int, enabled: bool):
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO user_settings (owner_id, logs_enabled) VALUES (?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET logs_enabled=excluded.logs_enabled",
+            (owner_id, int(enabled)),
+        )
+        await db.commit()
