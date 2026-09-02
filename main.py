@@ -9,9 +9,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import BOT_TOKEN
 from bot.database import init_db, all_running_accounts
 from bot.middlewares.access import AccessMiddleware
-from bot.services import session_manager, gift_sniper
+from bot.services import session_manager, gift_sniper, notifier
 
-from bot.handlers import start, accounts, gifts, settings, admin
+from bot.handlers import start, accounts, gifts, settings, admin, logs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +50,7 @@ async def main():
     dp.include_router(accounts.router)
     dp.include_router(gifts.router)
     dp.include_router(settings.router)
+    dp.include_router(logs.router)
     dp.include_router(admin.router)
 
     await _resume_running_accounts()
@@ -65,6 +66,7 @@ async def main():
         # it is pending" в логах при рестарте).
         log.info("Останавливаю активные подключения перед выходом...")
         await gift_sniper.stop_all()
+        await notifier.close()
 
 
 if __name__ == "__main__":
