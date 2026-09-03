@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from telethon import TelegramClient, functions, types
 
-from bot.config import SNIPE_MIN_PRICE, SNIPE_MAX_PRICE, POLL_INTERVAL
+from bot.config import SNIPE_MIN_PRICE, SNIPE_MAX_PRICE, POLL_INTERVAL, GIFT_CHECK_DELAY
 from bot.database import get_ignored_gifts, get_price_range
 from bot.services import notifier
 
@@ -37,6 +37,11 @@ _active_clients: dict[tuple[int, str], TelegramClient] = {}
 # одновременно открыться на один и тот же файл сессии (иначе sqlite
 # сессии ловит "database is locked" и session-хранилище портится).
 _locks: dict[tuple[int, str], asyncio.Lock] = {}
+# ключ: owner_id -> последний известный список подарков на маркете
+# (обновляется фоновым циклом мониторинга). Нужен, чтобы кнопка
+# "Подарки" отвечала мгновенно, а не заново опрашивала Telegram по
+# каждому подарку (это и было причиной медленного отклика кнопки).
+_last_market_gifts: dict[int, list["GiftListing"]] = {}
 
 
 def get_lock(key: tuple[int, str]) -> asyncio.Lock:
@@ -93,8 +98,24 @@ def _extract_stars_amount(amounts) -> int | None:
     return None
 
 
-async def fetch_gifts(client: TelegramClient) -> list[GiftListing]:
-    """Список подарков с их актуальной минимальной ценой."""
+async def fetch_gifts(
+    client: TelegramClient,
+    owner_id: int | None = None,
+    throttle: bool = False,
+) -> list[GiftListing]:
+    """
+    Список подарков с их актуальной минимальной ценой.
+
+    owner_id + throttle=True — режим фонового мониторинга: лоты каждого
+    подарка проверяются ПО ОТДЕЛЬНОСТИ, с логом в чат (если у
+    пользователя включены "Логи") и паузой GIFT_CHECK_DELAY между
+    запросами — без этой паузы Telegram быстро включает антифлуд на
+    payments.GetResaleStarGifts.
+
+    throttle=False (по умолчанию) — быстрый режим для разового чтения
+    (например, кнопка "Подарки" без активного мониторинга): без
+    искусственных пауз и без лог-сообщений.
+    """
     result: list[GiftListing] = []
     try:
         gifts_resp = await client(functions.payments.GetStarGiftsRequest(hash=0))
@@ -137,6 +158,13 @@ async def fetch_gifts(client: TelegramClient) -> list[GiftListing]:
             except Exception:
                 log.debug("Resale недоступен для %s", gift_id, exc_info=True)
 
+            if owner_id is not None and throttle:
+                price_text = f"{resale_price}⭐" if resale_price is not None else "нет лотов"
+                await notifier.send_log(
+                    owner_id, f'🔍 Проверка лотов подарка "{name}"... Мин цена - {price_text}'
+                )
+                await asyncio.sleep(GIFT_CHECK_DELAY)
+
         result.append(
             GiftListing(
                 gift_id=gift_id,
@@ -164,6 +192,13 @@ def on_market(g: GiftListing) -> bool:
 def filter_market_gifts(gifts: list["GiftListing"]) -> list["GiftListing"]:
     """Оставляет только те подарки, что реально выставлены на маркете."""
     return [g for g in gifts if on_market(g)]
+
+
+def get_cached_market_gifts(owner_id: int) -> list["GiftListing"] | None:
+    """Последний известный список подарков на маркете для этого
+    пользователя, накопленный фоновым мониторингом. None, если ни один
+    аккаунт этого пользователя ещё не проходил ни одного цикла опроса."""
+    return _last_market_gifts.get(owner_id)
 
 
 def cheapest_gift(gifts: list[GiftListing]) -> GiftListing | None:
@@ -238,12 +273,10 @@ async def _monitor_loop(owner_id: int, phone: str, client: TelegramClient):
         while True:
             ignored = await get_ignored_gifts(owner_id)
             min_price, max_price = await get_effective_price_range(owner_id)
-            gifts = await fetch_gifts(client)
-            market_gifts = [g for g in filter_market_gifts(gifts) if g.gift_id not in ignored]
-
-            if market_gifts:
-                names = ", ".join(f"«{g.name}»" for g in market_gifts)
-                await notifier.send_log(owner_id, f"🔍 Просмотр лотов подарка {names}")
+            gifts = await fetch_gifts(client, owner_id=owner_id, throttle=True)
+            market_gifts_all = filter_market_gifts(gifts)
+            _last_market_gifts[owner_id] = market_gifts_all
+            market_gifts = [g for g in market_gifts_all if g.gift_id not in ignored]
 
             balance = await get_stars_balance(client)
 
@@ -325,6 +358,11 @@ async def stop_sniper(owner_id: int, phone: str):
                 await client.disconnect()
             except Exception:
                 log.exception("Ошибка при остановке клиента %s/%s", owner_id, phone)
+
+        # если у пользователя больше не осталось запущенных аккаунтов —
+        # кэш подарков больше некому обновлять, чистим его
+        if not any(k[0] == owner_id for k in _running_tasks):
+            _last_market_gifts.pop(owner_id, None)
 
 
 async def stop_all():
