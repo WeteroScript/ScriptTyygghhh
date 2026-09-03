@@ -26,6 +26,13 @@ SNIPE_MAX_PRICE = _int("SNIPE_MAX_PRICE", "275")
 
 POLL_INTERVAL = _int("POLL_INTERVAL", "5")
 
+# Пауза между проверкой лотов КАЖДОГО отдельного подарка внутри одного
+# цикла опроса (payments.GetResaleStarGifts дёргается по одному подарку
+# за раз). Без этой паузы Telegram быстро включает антифлуд
+# (FLOOD_WAIT на GetResaleStarGiftsRequest), если подарков с активной
+# перепродажей много.
+GIFT_CHECK_DELAY = _float("GIFT_CHECK_DELAY", "1.5")
+
 DB_PATH = os.getenv("DB_PATH", "bot/database.sqlite3")
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions")
 
