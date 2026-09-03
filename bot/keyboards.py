@@ -60,11 +60,13 @@ def account_control_kb(lang: str, phone: str, running: bool) -> InlineKeyboardMa
 
 
 def gifts_kb(gifts, ignored: set, page: int = 0, total_pages: int = 1) -> InlineKeyboardMarkup:
-    """gifts: список dict {id, name, price} — уже нарезанный под текущую страницу."""
+    """gifts: список dict {id, name, price} — уже нарезанный под текущую страницу.
+    ✅ = бот отслеживает и может купить этот подарок, ❌ = игнорирует
+    (не просматривает лоты и не покупает)."""
     rows = []
     for g in gifts:
-        color = "🔴" if g["id"] in ignored else "🟢"
-        label = f"{color} {g['name']} — {g['price']}⭐️"
+        mark = "❌" if g["id"] in ignored else "✅"
+        label = f"{g['name']} — {g['price']}⭐️ {mark}"
         rows.append([InlineKeyboardButton(
             text=label, callback_data=f"gift:toggle:{page}:{g['id']}"
         )])
