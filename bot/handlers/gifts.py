@@ -66,7 +66,24 @@ async def _get_client_for_gifts(owner_id: int):
 async def _fetch_market_gifts(owner_id: int):
     """Возвращает (gifts_sorted, error) — только подарки, реально
     выставленные на маркете (не весь каталог магазина), отсортированные
-    по возрастанию цены. error=True, если подключиться/получить не удалось."""
+    по возрастанию цены. error=True, если подключиться/получить не удалось.
+
+    Если у пользователя уже запущен мониторинг хотя бы одного аккаунта —
+    берём готовый список из кэша фонового цикла (мгновенно, без новых
+    запросов к Telegram). Иначе — разовое подключение и чтение (медленнее,
+    но без искусственных задержек между подарками)."""
+    accounts = await list_accounts(owner_id)
+    if not accounts:
+        return [], True
+
+    for acc in accounts:
+        if gift_sniper.is_running(owner_id, acc["phone"]):
+            cached = gift_sniper.get_cached_market_gifts(owner_id)
+            if cached is not None:
+                market_gifts = sorted(cached, key=gift_sniper.effective_price)
+                return market_gifts, False
+            break  # мониторинг только что стартовал, кэш ещё не готов — читаем сами разово
+
     client, temporary = await _get_client_for_gifts(owner_id)
     if client is None:
         return [], True
